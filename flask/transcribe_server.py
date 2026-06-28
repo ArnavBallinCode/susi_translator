@@ -2191,6 +2191,7 @@ def stream_page(tenant_id: str):
     translations_enabled = registry.get_provider_name(tenant_id, role="translation") is not None
     
     return render_template("stream.html", tenant_id=tenant_id, video_url=video_url, stream_type=stream_type, audio_file_url=audio_file_url, translations_enabled=translations_enabled)
+<<<<<<< HEAD
 
 
 # Eagerly load the default models when the server starts
@@ -2214,6 +2215,8 @@ def _eager_load_models():
 
 if _env_bool('TRANSCRIBE_AUTOSTART_WORKER', True):
     _eager_load_models()
+=======
+>>>>>>> a506fda (fixed reviews and added changes)
 
 
 if __name__ == '__main__':
