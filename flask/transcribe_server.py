@@ -1485,7 +1485,16 @@ def translate_stream():
         yield f"data: {json.dumps({'status': 'connected'})}\n\n"
 
         try:
+            loop_counter = 0
             while True:
+                loop_counter += 1
+                if loop_counter % 25 == 0:
+                    with app.app_context():
+                        from auth.models import Room, db
+                        if not db.session.get(Room, tenant_id):
+                            yield f"data: {json.dumps({'status': 'error', 'message': 'Event has ended or room was deleted.'})}\n\n"
+                            break
+
                 with transcripts_lock:
                     tenant_transcripts = dict(transcriptd.get(tenant_id, {}))
 
