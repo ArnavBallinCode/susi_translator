@@ -6,6 +6,7 @@ A real-time speech-to-text (transcription) HTTP API built with Flask + flask-res
 
 ## High-Level Architecture
 
+<<<<<<< HEAD
 ```text
 ┌─────────────┐  POST /session    ┌──────────────────────────────────────┐
 │ audio_      │  POST /transcribe │  transcribe_server.py                │
@@ -24,6 +25,26 @@ A real-time speech-to-text (transcription) HTTP API built with Flask + flask-res
                                   │   tenant -> chunk -> txt (CTranslate2)     │
                                   └──────────────────────────────────────┘
                                                ▲
+=======
+```
+┌─────────────┐  POST /session   ┌──────────────────────────┐
+│ audio_      │ POST /transcripts│  transcribe_server.py    │
+│ grabber.py  │ ───────────────> │  (Flask + flask-restx)   │
+│ (mic/file/  │                  │                          │
+│  url/stdin  │                  │  ┌────────────────────┐  │
+│  /platform) │                  │  │ audio_stack queue  │  │
+└─────────────┘                  │  └─────────┬──────────┘  │
+                                 │            ▼             │
+                                 │  ┌────────────────────┐  │      Whisper
+                                 │  │ process_audio()    │──┼──▶  (local model
+                                 │  │ worker thread      │  │       OR whisper.cpp
+                                 │  └─────────┬──────────┘  │       HTTP server)
+                                 │            ▼             │
+                                 │  transcriptd (in-memory) │
+                                 │   tenant -> chunk -> txt │
+                                 └──────────────────────────┘
+                                              ▲
+>>>>>>> 77f47a9 (corrected the stream type for whitelisted streams)
                   GET /transcripts, /transcripts/first, etc.
 ```
 
@@ -33,7 +54,7 @@ A real-time speech-to-text (transcription) HTTP API built with Flask + flask-res
 
 **1. Producer side (`audio_grabber.py` / `audio_sources.py`)**
 
-Grabs ~1s frames of 16 kHz / 16-bit / mono PCM from a mic, file, URL, stdin, or YouTube. Accumulates up to ~10s buffers (resets on silence) and POSTs each as base64 to `/transcripts`.
+Grabs ~1s frames of 16 kHz / 16-bit / mono PCM from a mic, file, URL, stdin, or platform (YouTube/Vimeo/Twitch). Accumulates up to ~10s buffers (resets on silence) and POSTs each as base64 to `/transcripts`.
 
 **2. Server side (`transcribe_server.py`)**
 
@@ -46,7 +67,7 @@ Grabs ~1s frames of 16 kHz / 16-bit / mono PCM from a mic, file, URL, stdin, or 
 ## Key Design Pieces
 
 **Sessions and source aliases.**
-Instead of forcing clients to track UUIDs, `POST /session?source=mic|file|url|stdin|youtube` mints a tenant UUID and registers it as "the latest session for that source." Read endpoints accept `?source=mic`, which resolves to that current tenant ID. Sessions expire after `SESSION_TTL_SECONDS` (default 7200s).
+Instead of forcing clients to track UUIDs, `POST /session?source=mic|file|url|stdin|platform` mints a tenant UUID and registers it as "the latest session for that source." Read endpoints accept `?source=mic`, which resolves to that current tenant ID. Sessions expire after `SESSION_TTL_SECONDS` (default 7200s).
 
 **Pluggable provider architecture.**
 `POST /api/v1/translate/configure` selects per-tenant transcription and translation backends via the `ProviderRegistry`. Available providers: `faster_whisper` (CTranslate2-accelerated Whisper) for transcription and `nllb_ctranslate2` (Facebook NLLB-200 via CTranslate2) for translation. Providers are loaded lazily in background warmup threads and shared across tenants with identical configs to avoid duplicate model copies in RAM.
@@ -76,8 +97,13 @@ All API endpoints now require JWT authentication. The app requires `JWT_SECRET_K
 All endpoints are available under `/swagger`.
 
 | Method | Path | Purpose |
+<<<<<<< HEAD
 | --- | --- | --- |
 | `POST` | `/session` | Mint a tenant UUID for a source (`mic`/`file`/`url`/`stdin`/`youtube`) — returns `201 Created` |
+=======
+|---|---|---|
+| `POST` | `/session` | Mint a tenant UUID for a source (`mic`/`file`/`url`/`stdin`/`platform`) — returns `201 Created` |
+>>>>>>> 77f47a9 (corrected the stream type for whitelisted streams)
 | `POST` | `/transcripts` | Submit a base64 audio chunk for async processing — returns `202 Accepted` |
 | `GET` | `/transcripts` | All transcripts in `[from, until]` |
 | `GET` | `/transcripts/count` | Count of transcripts in `[from, until]` |
@@ -111,7 +137,7 @@ Swagger and log a deprecation warning. Migrate to the REST paths above.
 
 ## Other Files in `flask/`
 
-- **`audio_grabber.py`** — CLI client orchestrator (subcommands `mic`, `file`, `url`, `stdin`, `youtube`).
+- **`audio_grabber.py`** — CLI client orchestrator (subcommands `mic`, `file`, `url`, `stdin`, `platform`).
 - **`audio_sources.py`** — `AudioSource` ABC + four concrete implementations; `URLSource` has explicit security validation (rejects `file://`, `concat:`, leading `-` to block ffmpeg arg injection).
 - **`transcribe_listener.html`, `transcribe_evaluation.html`, `audio_grabber.html`** — browser UIs that hit the same API.
 - **`tests/`** — pytest suite (`conftest.py` pins `WHISPER_SERVER_USE=true` so tests don't download multi-hundred-MB models).
