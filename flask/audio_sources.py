@@ -53,12 +53,17 @@ def validate_hls_manifest(manifest_url: str, timeout: int = 10) -> None:
     pointing at internal addresses. ffmpeg would blindly fetch those.
     """
     try:
-        req = urllib.request.Request(
-            manifest_url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            raw = resp.read(1_000_000).decode("utf-8", errors="replace")  # 1 MB cap
+        import requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        resp = requests.get(manifest_url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        raw = resp.text[:1_000_000]  # 1 MB cap
     except Exception as exc:
         raise ValueError(f"Could not fetch HLS manifest: {exc}") from exc
 
