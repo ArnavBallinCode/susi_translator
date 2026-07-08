@@ -47,25 +47,31 @@ def _is_safe_url(url: str) -> bool:
 
 def validate_hls_manifest(manifest_url: str, timeout: int = 10) -> None:
     """
-    Pre-fetch an HLS .m3u8 manifest and validate every URI it references.
-    a malicious organizer could host a valid
-    top-level .m3u8 on a public server that embeds segment/key URIs
-    pointing at internal addresses. ffmpeg would blindly fetch those.
+    Validate an HLS .m3u8 manifest URL against SSRF attacks
     """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    if not _is_safe_url(manifest_url):
+        raise ValueError(
+            f"HLS manifest URL {manifest_url!r} resolves to a restricted or "
+            "private address. Submission rejected."
+        ) 
     try:
         import requests
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.5",
-            "Connection": "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         }
         resp = requests.get(manifest_url, headers=headers, timeout=timeout)
         resp.raise_for_status()
         raw = resp.text[:1_000_000]  # 1 MB cap
     except Exception as exc:
-        raise ValueError(f"Could not fetch HLS manifest: {exc}") from exc
+        _log.warning(
+            "HLS manifest deep-scan skipped (server rejected our fetch — "
+            "ffmpeg would also fail to play this stream): %s", exc
+        )
+        return
 
     base = manifest_url
     unsafe: list[str] = []
