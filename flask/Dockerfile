@@ -31,8 +31,11 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Install all production deps from the pinned lockfile
 RUN uv sync --frozen --no-dev
 
+# Copy the gunicorn config
+COPY gunicorn.conf.py /app/gunicorn.conf.py
+
 # Copy Flask application code
 COPY flask/ .
 
 EXPOSE 5040
-CMD ["gunicorn", "--worker-class", "gevent", "-w", "1", "--timeout", "120", "-b", "0.0.0.0:5040", "transcribe_server:app"]
+CMD ["gunicorn", "-c", "/app/gunicorn.conf.py", "transcribe_server:app"]
