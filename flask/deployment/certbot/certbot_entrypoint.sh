@@ -33,6 +33,7 @@ while :; do
         --manual \
         --preferred-challenges dns \
         --manual-auth-hook /opt/certbot-scripts/authenticator.sh \
+        --manual-cleanup-hook /opt/certbot-scripts/cleanup.sh \
         -d "$DOMAIN_NAME" \
         --cert-name "${DOMAIN_NAME}" \
         --keep-until-expiring
