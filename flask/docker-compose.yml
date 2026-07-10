@@ -44,8 +44,8 @@ services:
       dockerfile: Dockerfile.nginx
     container_name: susi_nginx
     restart: always
-    env_file:
-      - .env
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME}
     ports:
       - "80:80"
       - "443:443"
@@ -62,12 +62,14 @@ services:
     image: certbot/certbot
     container_name: susi_certbot
     restart: always
-    env_file:
-      - .env
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL}
+      DUCKDNS_TOKEN: ${DUCKDNS_TOKEN}
     volumes:
       - ./deployment/certbot:/opt/certbot-scripts
       - certbot_certs:/etc/letsencrypt
-    entrypoint: ["/bin/sh", "/opt/certbot-scripts/entrypoint.sh"]
+    entrypoint: ["/bin/sh", "/opt/certbot-scripts/certbot_entrypoint.sh"]
     depends_on:
       - nginx
     networks:

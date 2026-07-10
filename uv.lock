@@ -3760,7 +3760,7 @@ requires-dist = [
     { name = "nvidia-cublas-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-cuda-runtime-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "nvidia-cudnn-cu12", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
-    { name = "psycopg2-binary", specifier = ">=2.9" },
+    { name = "psycopg2-binary", specifier = ">=2.9.9" },
     { name = "pyaudio" },
     { name = "pybars3" },
     { name = "pydub" },

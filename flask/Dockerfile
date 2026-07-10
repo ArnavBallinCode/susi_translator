@@ -34,8 +34,9 @@ RUN uv sync --frozen --no-dev
 # Copy the gunicorn config
 COPY gunicorn.conf.py /app/gunicorn.conf.py
 
-# Copy Flask application code
+# Copy Flask application code and entrypoint
 COPY flask/ .
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 5040
-CMD ["gunicorn", "-c", "/app/gunicorn.conf.py", "transcribe_server:app"]
+ENTRYPOINT ["/app/entrypoint.sh"]
