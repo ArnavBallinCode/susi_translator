@@ -1,8 +1,9 @@
 from flask import Flask, request, jsonify, abort, Response, redirect, url_for, render_template
 from flask_restx import Api, Resource, fields
 from flask_cors import CORS
-from flask_jwt_extended import JWTManager, verify_jwt_in_request
+from flask_jwt_extended import JWTManager, verify_jwt_in_request, get_jwt
 from flask_bcrypt import Bcrypt
+from flask_sock import Sock
 from werkzeug.exceptions import HTTPException
 import numpy as np
 import threading
@@ -93,6 +94,7 @@ def _env_csv(name: str, default: str) -> list:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 app = Flask(__name__)
+sock = Sock(app)
 api = Api(app, version='1.0', title='Transcription API',
           description='A simple Transcription API', doc='/swagger',
           decorators=[organizer_required])
@@ -108,6 +110,10 @@ if "*" in _cors_origins:
 
 CORS(app, resources={r"/*": {"origins": _cors_origins}}, supports_credentials=True)
 logger.info(f"CORS allowed origins: {_cors_origins}")
+
+MAX_STREAM_CONNECTIONS_PER_TENANT = int(os.environ.get("MAX_STREAM_CONNECTIONS_PER_TENANT", os.environ.get("MAX_WS_CONNECTIONS_PER_TENANT", 50)))
+stream_connections = {}
+stream_connections_lock = threading.Lock()
 
 # Database, Auth, JWT 
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///susi.db")
@@ -133,7 +139,7 @@ app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 # 10MB max upload size limit
 
 # Lifetime of the short-lived token issued to the audio_grabber subprocess.
 # The grabber refreshes it proactively at 80% of this window.
-# Must be greater than the longest possible audio chunk upload time (~30 s).
+# Must be greater than the longest possible audio chunk upload time.
 _INTERNAL_TOKEN_EXPIRY: timedelta = timedelta(
     minutes=int(os.getenv("INTERNAL_TOKEN_EXPIRY_MINUTES", "5"))
 )
@@ -165,11 +171,6 @@ from flask_admin.theme import Bootstrap4Theme
 admin = Admin(app, name='SUSI Admin', theme=Bootstrap4Theme(swatch='flatly'), url='/admin', index_view=SecureAdminIndexView())
 from auth.models import Organizer
 admin.add_view(SecureModelView(Organizer, db, name="Users/Organizers"))
-
-
-# #TODO: will be deleted after the merge of migrations PR
-# with app.app_context():
-#     db.create_all()
 
 
 # Shared in-memory state
@@ -1035,7 +1036,6 @@ def configure_provider():
         organizer = None
         if email:
             organizer = Organizer.query.filter_by(email=email).first()
-
         stream_url = data.get("stream_url")
         stream_type = data.get("stream_type", "youtube")
 
@@ -1120,6 +1120,12 @@ def configure_provider():
             grabber_env = {k: os.environ[k] for k in safe_env_keys if k in os.environ}
             grabber_env["GRABBER_AUTH_TOKEN"] = internal_token
 
+            
+            venv_bin = os.path.dirname(sys.executable)
+            existing_path = grabber_env.get("PATH", "")
+            if venv_bin not in existing_path.split(os.pathsep):
+                grabber_env["PATH"] = venv_bin + os.pathsep + existing_path
+
             # Only applicable for the youtube source.
             if stream_type == "youtube":
                 cookies_path = os.path.join(
@@ -1179,6 +1185,102 @@ def configure_provider():
         return jsonify({"status": "error", "message": f"Configuration failed: {str(e)}"}), 500
 
 
+def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=False):
+    """
+    Shared generator for transcripts, translations, and yielding events
+    """
+    sent_transcripts = {}
+    translated_transcripts = {}
+    last_translations = {}
+    last_translation_time = 0.0
+    sent_audio = {}
+    loop_counter = 0
+
+    while True:
+        loop_counter += 1
+        if loop_counter % 25 == 0:
+            with app.app_context():
+                from auth.models import Room, db
+                if not db.session.get(Room, tenant_id):
+                    yield [{"status": "error", "message": "Event has ended or room was deleted."}], True
+                    return
+
+        with transcripts_lock:
+            tenant_transcripts = dict(transcriptd.get(tenant_id, {}))
+
+        now = time.time()
+        # Default throttle interval
+        throttle_interval = 0.0
+        can_translate = (now - last_translation_time) >= throttle_interval
+
+        events_to_send = []
+
+        for cid in _numeric_sorted_keys(tenant_transcripts):
+            cid_int = _chunk_id_int(cid)
+            if cid_int >= last_chunk_id:
+                text = tenant_transcripts[cid]['transcript']
+
+                needs_tx_update = sent_transcripts.get(cid) != text
+                needs_tl_update = target_lang and (translated_transcripts.get(cid) != text)
+
+                translation = last_translations.get(cid, "")
+
+                if needs_tl_update and can_translate:
+                    try:
+                        lang_config = registry.get_language_config(tenant_id)
+                        source_lang = lang_config.get('source_lang', 'en')
+                        new_tl = registry.translate(tenant_id, text, source_lang, target_lang)
+                        if new_tl:
+                            translation = new_tl
+                        last_translations[cid] = translation
+                        translated_transcripts[cid] = text
+                        last_translation_time = time.time()
+                        can_translate = False  # Only 1 translation per loop to spread load
+                    except Exception as e:
+                        logger.error(f"Stream translation error for {tenant_id}: {e}")
+
+                is_ready_update = needs_tx_update or (needs_tl_update and translated_transcripts.get(cid) == text)
+                
+                tts_text = translation if target_lang else text
+                needs_audio_update = False
+                audio_b64 = None
+
+                if wants_audio and tts_text:
+                    # Truncate extremely long texts to prevent CPU DoS during synthesis
+                    if len(tts_text) > 300:
+                        tts_text = tts_text[:297] + "..."
+                    
+                    lang_to_speak = target_lang if target_lang else registry.get_language_config(tenant_id).get('source_lang', 'en')
+                    cache_key = (lang_to_speak, tts_text)
+                    cached_audio = tts_cache.get(cache_key)
+                    
+                    if cached_audio in ('pending', 'failed'):
+                        pass
+                    elif cached_audio is not None:
+                        audio_b64 = cached_audio
+                        if sent_audio.get(cid) != tts_text:
+                            needs_audio_update = True
+                    else:
+                        latest_tts_requests[(tenant_id, cid)] = tts_text
+                        tts_cache[cache_key] = 'pending'
+                        tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
+
+                if is_ready_update or needs_audio_update:
+                    payload = {
+                        "chunk_id": cid,
+                        "transcript": text,
+                        "translation": translation,
+                    }
+                    
+                    if needs_audio_update and audio_b64:
+                        payload["audio_b64"] = audio_b64
+                        sent_audio[cid] = tts_text
+
+                    events_to_send.append(payload)
+                    sent_transcripts[cid] = text
+
+        yield events_to_send, False
+
 # SSE streaming endpoint
 
 @app.route('/api/v1/translate/stream', methods=['GET'])
@@ -1201,99 +1303,149 @@ def translate_stream():
     last_chunk_id = _parse_int_arg(request.args, 'last_chunk_id', default=0)
     wants_audio = request.args.get('audio', 'false').lower() == 'true'
 
-    def event_stream():
-        sent_transcripts = {}
-        translated_transcripts = {}
-        last_translations = {}
-        last_translation_time = 0.0
-        sent_audio = {}
+    with stream_connections_lock:
+        current_connections = stream_connections.get(tenant_id, 0)
+        if current_connections >= MAX_STREAM_CONNECTIONS_PER_TENANT:
+            logger.warning(f"Stream connection cap reached for tenant {tenant_id}")
+            return jsonify({"status": "error", "message": "Too many connections."}), 429
+        stream_connections[tenant_id] = current_connections + 1
 
+    def event_stream():
         yield f"data: {json.dumps({'status': 'connected'})}\n\n"
 
         try:
-            while True:
-                with transcripts_lock:
-                    tenant_transcripts = dict(transcriptd.get(tenant_id, {}))
-
-                now = time.time()
-                provider_name = registry.get_provider_name(tenant_id, "translation")
-                # Default throttle interval (can be increased for rate-limited providers)
-                throttle_interval = 0.0
-                can_translate = (now - last_translation_time) >= throttle_interval
-
-                events_to_send = []
-
-                for cid in _numeric_sorted_keys(tenant_transcripts):
-                    cid_int = _chunk_id_int(cid)
-                    if cid_int >= last_chunk_id:
-                        text = tenant_transcripts[cid]['transcript']
-                        needs_tx_update = sent_transcripts.get(cid) != text
-                        needs_tl_update = target_lang and (translated_transcripts.get(cid) != text)
-
-                        translation = last_translations.get(cid, "")
-
-                        if needs_tl_update and can_translate:
-                            try:
-                                lang_config = registry.get_language_config(tenant_id)
-                                source_lang = lang_config.get('source_lang', 'en')
-                                new_tl = registry.translate(tenant_id, text, source_lang, target_lang)
-                                if new_tl:
-                                    translation = new_tl
-                                last_translations[cid] = translation
-                                translated_transcripts[cid] = text
-                                last_translation_time = time.time()
-                                can_translate = False  # Only 1 translation per loop to spread load
-                            except Exception as e:
-                                logger.error(f"Stream translation error for {tenant_id}: {e}")
-
-                        is_ready_update = needs_tx_update or (needs_tl_update and translated_transcripts.get(cid) == text)
-                        
-                        tts_text = translation if target_lang else text
-                        needs_audio_update = False
-                        audio_b64 = None
-
-                        if wants_audio and tts_text:
-                            # Truncate extremely long texts to prevent CPU DoS during synthesis
-                            if len(tts_text) > 300:
-                                tts_text = tts_text[:297] + "..."
-                            
-                            lang_to_speak = target_lang if target_lang else registry.get_language_config(tenant_id).get('source_lang', 'en')
-                            cache_key = (lang_to_speak, tts_text)
-                            cached_audio = tts_cache.get(cache_key)
-                            
-                            if cached_audio in ('pending', 'failed'):
-                                pass
-                            elif cached_audio is not None:
-                                audio_b64 = cached_audio
-                                if sent_audio.get(cid) != tts_text:
-                                    needs_audio_update = True
-                            else:
-                                latest_tts_requests[(tenant_id, cid)] = tts_text
-                                tts_cache[cache_key] = 'pending'
-                                tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
-
-                        if is_ready_update or needs_audio_update:
-                            payload = {
-                                "chunk_id": cid,
-                                "transcript": text,
-                                "translation": translation,
-                            }
-                            
-                            if needs_audio_update and audio_b64:
-                                payload["audio_b64"] = audio_b64
-                                sent_audio[cid] = tts_text
-
-                            events_to_send.append(payload)
-                            sent_transcripts[cid] = text
-
+            for events_to_send, should_stop in _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio):
                 for payload in events_to_send:
                     yield f"data: {json.dumps(payload)}\n\n"
-
+                if should_stop:
+                    break
                 time.sleep(0.2)
         except GeneratorExit:
             logger.info(f"SSE Client disconnected for tenant {tenant_id}")
+        finally:
+            with stream_connections_lock:
+                stream_connections[tenant_id] -= 1
+                if stream_connections[tenant_id] <= 0:
+                    del stream_connections[tenant_id]
 
     return Response(event_stream(), mimetype="text/event-stream")
+
+
+# WebSocket streaming endpoint 
+def _translate_stream_ws_handler(ws):
+    """
+    Core WebSocket handler for real-time captions
+    """
+    from flask_jwt_extended.exceptions import JWTExtendedException
+    from jwt.exceptions import PyJWTError
+    from simple_websocket import ConnectionClosed
+
+    # Origin check for ws
+    origin = request.headers.get('Origin')
+    if origin and origin not in _cors_origins and '*' not in _cors_origins:
+        logger.warning(f"WS origin {origin} rejected. Allowed: {_cors_origins}")
+        try:
+            ws.send(json.dumps({"status": "error", "message": "Forbidden Origin"}))
+        except Exception:
+            pass
+        return
+
+    # Auth
+    try:
+        verify_jwt_in_request(locations=["cookies", "headers"])
+    except (JWTExtendedException, PyJWTError) as exc:
+        logger.warning(f"WS auth rejected: {exc.__class__.__name__}: {exc}")
+        try:
+            ws.send(json.dumps({"status": "error", "message": "Authentication required."}))
+        except Exception:
+            pass
+        return
+
+    _ws_claims = get_jwt()
+    if _ws_claims.get("role") == "internal":
+        logger.warning(
+            f"Internal token rejected for WS /ws/v1/translate/stream "
+            f"(tenant={_ws_claims.get('tenant_id', 'unknown')})"
+        )
+        try:
+            ws.send(json.dumps({"status": "error", "message": "Forbidden."}))
+        except Exception:
+            pass
+        return
+
+    # Params
+    tenant_id = _resolve_tenant(request.args)
+    if not tenant_id:
+        try:
+            ws.send(json.dumps({"status": "error", "message": "Missing 'tenant_id'"}))
+        except Exception:
+            pass
+        return
+
+    try:
+        _assert_tenant_ownership(tenant_id)
+    except HTTPException as e:
+        if e.code == 403:
+            try:
+                ws.send(json.dumps({"status": "error", "message": "Forbidden."}))
+            except Exception:
+                pass
+            return
+        raise # let other HTTP exceptions bubble up or be logged
+
+    # Connection Cap
+    with stream_connections_lock:
+        current_connections = stream_connections.get(tenant_id, 0)
+        if current_connections >= MAX_STREAM_CONNECTIONS_PER_TENANT:
+            logger.warning(f"WS connection cap reached for tenant {tenant_id}")
+            try:
+                ws.send(json.dumps({"status": "error", "message": "Too many connections."}))
+            except Exception:
+                pass
+            return
+        stream_connections[tenant_id] = current_connections + 1
+
+    try:
+        source = request.args.get('source', 'mic')
+        target_lang = request.args.get('target_lang')
+        if target_lang == 'original':
+            target_lang = None
+        elif not target_lang:
+            target_lang = registry.get_language_config(tenant_id).get('target_lang')
+        last_chunk_id = _parse_int_arg(request.args, 'last_chunk_id', default=0)
+        wants_audio = request.args.get('audio', 'false').lower() == 'true'
+
+        # Send connection established frame
+        try:
+            ws.send(json.dumps({'status': 'connected'}))
+        except ConnectionClosed:
+            return
+
+        try:
+            for events_to_send, should_stop in _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio):
+                for payload in events_to_send:
+                    ws.send(json.dumps(payload))
+                if should_stop:
+                    break
+                _ = ws.receive(timeout=0.2)
+
+        except ConnectionClosed:
+            logger.info(f"WS client disconnected for tenant {tenant_id}")
+
+        except Exception:
+            logger.error(f"Unexpected error in WS stream for tenant {tenant_id}", exc_info=True)
+
+    finally:
+        with stream_connections_lock:
+            stream_connections[tenant_id] -= 1
+            if stream_connections[tenant_id] <= 0:
+                del stream_connections[tenant_id]
+
+
+# Register the handler on the WebSocket route
+sock.route('/ws/v1/translate/stream')(_translate_stream_ws_handler)
+
+
 
 
 # Tenant lifecycle endpoints
@@ -1723,7 +1875,10 @@ def stream_page(tenant_id: str):
     audio_file_url = ""
     if stream_type == "file":
         audio_file_url = url_for("serve_audio_file", tenant_id=tenant_id)
-    return render_template("stream.html", tenant_id=tenant_id, video_url=video_url, stream_type=stream_type, audio_file_url=audio_file_url)
+        
+    translations_enabled = registry.get_provider_name(tenant_id, role="translation") is not None
+    
+    return render_template("stream.html", tenant_id=tenant_id, video_url=video_url, stream_type=stream_type, audio_file_url=audio_file_url, translations_enabled=translations_enabled)
 
 
 if __name__ == '__main__':
