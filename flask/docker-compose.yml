@@ -1,7 +1,7 @@
 
 services:
   db:
-    image: postgres:15
+    image: postgres:15.7
     container_name: susi_db
     restart: always
     environment:
@@ -34,7 +34,14 @@ services:
       - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
     volumes:
       - ./instance:/app/instance
-      - model_cache:/root/.cache
+      - model_cache:/app/.cache
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+          cpus: '4'
+        reservations:
+          memory: 512M
     expose:
       - "5040"
     networks:
@@ -63,11 +70,11 @@ services:
   certbot:
     image: certbot/certbot
     container_name: susi_certbot
-    restart: always
+    restart: on-failure
     environment:
       DOMAIN_NAME: ${DOMAIN_NAME}
       CERTBOT_EMAIL: ${CERTBOT_EMAIL}
-      DUCKDNS_TOKEN: ${DUCKDNS_TOKEN}
+      DNS_TOKEN: ${DNS_TOKEN}
     volumes:
       - ./deployment/certbot:/opt/certbot-scripts
       - certbot_certs:/etc/letsencrypt

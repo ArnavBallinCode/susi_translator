@@ -1,26 +1,26 @@
 #!/bin/sh
+set -e
 
-# DuckDNS Authenticator Hook for Certbot
-# Called by Certbot during DNS-01 challenge to update DuckDNS TXT record.
+# DNS Provider Authenticator Hook for Certbot
+# Called by Certbot during DNS-01 challenge to update the DNS provider TXT record.
 
-if [ -z "$DUCKDNS_TOKEN" ]; then
-    echo "Error: DUCKDNS_TOKEN environment variable is not set."
+if [ -z "$DNS_TOKEN" ]; then
+    echo "Error: DNS_TOKEN environment variable is not set."
     exit 1
 fi
 
-# Extract the subdomain (e.g., 'susi' from 'susi.duckdns.org')
-SUBDOMAIN=$(echo "$CERTBOT_DOMAIN" | sed 's/\.duckdns\.org//')
+# Extract the subdomain from the domain name (e.g., 'susi' from 'susi.example.org')
+SUBDOMAIN=$(echo "$CERTBOT_DOMAIN" | sed 's/\.[^.]*\.[^.]*$//')
 
-echo "Sending TXT record to DuckDNS for subdomain: $SUBDOMAIN"
+echo "Sending TXT record to DNS provider for subdomain: $SUBDOMAIN"
 
-# DuckDNS only supports GET requests, so the token must be in the URL.
-# We cannot use a POST request body to hide it from intermediate logs.
-RESPONSE=$(wget -qO- "https://www.duckdns.org/update?domains=${SUBDOMAIN}&token=${DUCKDNS_TOKEN}&txt=${CERTBOT_VALIDATION}")
+# The DNS provider API uses GET requests; the token is passed as a URL parameter.
+RESPONSE=$(wget -qO- "https://www.duckdns.org/update?domains=${SUBDOMAIN}&token=${DNS_TOKEN}&txt=${CERTBOT_VALIDATION}")
 
 if [ "$RESPONSE" = "OK" ]; then
-    echo "Successfully updated DuckDNS TXT record."
+    echo "Successfully updated DNS provider TXT record."
 else
-    echo "Failed to update DuckDNS TXT record. Response: $RESPONSE"
+    echo "Failed to update DNS provider TXT record. Response: $RESPONSE"
     exit 1
 fi
 
