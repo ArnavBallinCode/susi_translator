@@ -18,6 +18,15 @@ services:
     networks:
       - susi_net
 
+  redis:
+    image: redis:7-alpine
+    container_name: susi_redis
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - susi_net
+
   web:
     build:
       context: ..
@@ -94,3 +103,4 @@ volumes:
   model_cache:
   certbot_certs:
   pgdata:
+  redis_data:
