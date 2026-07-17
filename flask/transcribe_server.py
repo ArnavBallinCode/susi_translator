@@ -284,6 +284,7 @@ _tts_lock = threading.Lock()
 tts_inference_lock = threading.Lock()
 tts_executor = ThreadPoolExecutor(max_workers=1)
 translation_executor = ThreadPoolExecutor(max_workers=1)
+
 class SizeBoundedTTSCache:
     def __init__(self, max_size_bytes=50 * 1024 * 1024):
         self.cache = OrderedDict()
@@ -1389,6 +1390,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         del pending_translations[cid]
                         try:
                             new_tl = fut.result()
+
                             if pending_text != text:
                                 logger.debug(
                                     f"[TTS] Discarding stale translation for chunk {cid}: "
@@ -1403,6 +1405,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                                 last_translation_time = time.time()
                                 needs_tl_update = False  # Already translated
                                 newly_translated = True
+
                         except Exception as e:
                             logger.error(f"Async translation error for {tenant_id}/{cid}: {e}")
 
@@ -1424,10 +1427,12 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                     except Exception as e:
                         logger.error(f"Stream translation submit error for {tenant_id}: {e}")
 
+
                 # Send transcript updates in real time.
                 # Send translation update only when it *just* arrived (newly_translated).
                 # This prevents sending the same translation text on every loop iteration.
                 is_ready_update = needs_tx_update or newly_translated
+
 
                 needs_audio_update = False
                 audio_b64 = None
@@ -1439,6 +1444,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         lang_to_speak = target_lang if target_lang else registry.get_language_config(tenant_id).get('source_lang', 'en')
                         cache_key = (lang_to_speak, tts_text)
                         cached_audio = tts_cache.get(cache_key)
+
 
                         if cached_audio in ('pending', 'failed'):
                             pass
@@ -1454,6 +1460,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                                 latest_tts_requests[(tenant_id, cid)] = tts_text
                                 tts_cache[cache_key] = 'pending'
                                 tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
+
 
                 if is_ready_update or needs_audio_update:
                     payload = {
