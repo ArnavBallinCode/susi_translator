@@ -284,7 +284,10 @@ _tts_lock = threading.Lock()
 tts_inference_lock = threading.Lock()
 tts_executor = ThreadPoolExecutor(max_workers=1)
 translation_executor = ThreadPoolExecutor(max_workers=1)
+<<<<<<< HEAD
 
+=======
+>>>>>>> ae197b5 (all working fine local)
 class SizeBoundedTTSCache:
     def __init__(self, max_size_bytes=50 * 1024 * 1024):
         self.cache = OrderedDict()
@@ -1328,10 +1331,11 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
     sent_audio = {}
     loop_counter = 0
     pending_translations = {}
-    # Track when each chunk's text last changed 
+
     chunk_last_text = {}     
     chunk_stable_since = {}  
     TEXT_STABLE_SECS = 2.0    
+
 
     while True:
         loop_counter += 1
@@ -1348,6 +1352,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
         now = time.time()
         # No global throttle
         can_translate = True
+
 
 
         events_to_send = []
@@ -1368,6 +1373,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                     if cid in pending_translations:
                         old_fut, _ = pending_translations.pop(cid)
                         old_fut.cancel()  
+
 
                 text_is_stable = (now - chunk_stable_since.get(cid, now)) >= TEXT_STABLE_SECS
 
