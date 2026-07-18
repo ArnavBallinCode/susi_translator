@@ -1346,8 +1346,9 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
             tenant_transcripts = dict(transcriptd.get(tenant_id, {}))
 
         now = time.time()
-        # No global throttle — translations are already gated to finalized chunks only
+        # No global throttle
         can_translate = True
+
 
         events_to_send = []
 
