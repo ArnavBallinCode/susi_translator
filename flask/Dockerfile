@@ -36,7 +36,7 @@ ENV PATH="/app/.venv/bin:$PATH"
 ENV XDG_CACHE_HOME=/app/.cache
 
 # Install all production deps from the pinned lockfile
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev && uv cache clean
 
 # Copy the gunicorn config
 COPY gunicorn.conf.py /app/gunicorn.conf.py
