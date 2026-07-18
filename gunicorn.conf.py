@@ -14,8 +14,8 @@ bind = f"{host}:{port}"
 
 # keep workers=1, the app uses in-process shared state.
 workers = 1
-worker_class = "gevent"
-worker_connections = 1000  # concurrent greenlet connections per worker
+worker_class = "gthread"
+threads = 20  # concurrent OS threads per worker
 
 
 # Timeouts
