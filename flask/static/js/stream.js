@@ -179,8 +179,6 @@ document.addEventListener('DOMContentLoaded', () => {
     let isPlaying = false;
     let currentAudio = null;
     let currentAudioId = null;
-    // Track which chunk IDs have already been spoken — never speak the same chunk twice
-    const playedChunkIds = new Set();
 
     function stopAndClearAudio() {
         audioQueue = [];
@@ -283,13 +281,24 @@ document.addEventListener('DOMContentLoaded', () => {
             translEl.style.display = 'none';
         }
 
-        // Push audio only when TTS active, audio arrived, and this chunk hasn't been spoken yet.
-        // If a better (final, stable) translation arrives before playback starts, it replaces
-        // the queued entry. Once the chunk is in playedChunkIds, it is never spoken again.
-        if (playAudio && data.audio_b64 && !playedChunkIds.has(data.chunk_id)) {
+        // Push audio to queue if present
+        if (playAudio && data.audio_b64) {
             const audioUrl = `data:audio/wav;base64,${data.audio_b64}`;
-            // Replace any pending (not-yet-played) entry for this chunk with the latest audio
+
+            // Remove any pending audio in the queue for this exact chunk
             audioQueue = audioQueue.filter(item => item.id !== data.chunk_id);
+
+            // If we are currently playing an older version of this exact chunk, stop it
+            if (isPlaying && currentAudioId === data.chunk_id) {
+                if (currentAudio) {
+                    currentAudio.pause();
+                    currentAudio.currentTime = 0;
+                    currentAudio = null;
+                }
+                isPlaying = false;
+            }
+
+            // Add the new updated audio to the end of the queue
             audioQueue.push({ id: data.chunk_id, url: audioUrl });
             playNextAudio();
         }
@@ -439,7 +448,6 @@ document.addEventListener('DOMContentLoaded', () => {
         isPlaying = true;
         const nextItem = audioQueue.shift();
         currentAudioId = nextItem.id;
-        playedChunkIds.add(currentAudioId);  // Mark as played so it never re-queues
         
         // Unhide this block and any preceding hidden blocks to sync text with audio
         const allBlocks = document.querySelectorAll('.caption-block');

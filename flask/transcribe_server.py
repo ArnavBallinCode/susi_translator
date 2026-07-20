@@ -278,12 +278,11 @@ latest_session_by_source = {s: None for s in VALID_SOURCES}
 session_lock = threading.Lock()
 SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', '7200'))
 
-#TTS
+#TTS 
 _supertonic_tts = None
 _tts_lock = threading.Lock()
 tts_inference_lock = threading.Lock()
 tts_executor = ThreadPoolExecutor(max_workers=1)
-translation_executor = ThreadPoolExecutor(max_workers=1)
 <<<<<<< HEAD
 
 =======
@@ -381,18 +380,17 @@ def generate_tts_sync(text, target_lang):
         # Get voice style, fallback to F1 if not mapped
         style_name = TTS_VOICE_STYLES.get(target_lang, "F1")
         voice_style = tts_engine.get_voice_style(voice_name=style_name)
-        try:
-            with tts_inference_lock:
-                wav, duration = tts_engine.synthesize(
-                    text=text, 
-                    lang=lang_tag, 
-                    voice_style=voice_style,
-                    total_steps=8,  # Default medium quality
-                    speed=1.0
-                )
-        except Exception as e:
-            logger.error(f"Synthesis failed: {e}")
-            raise
+        
+        with tts_inference_lock:
+            wav, duration = tts_engine.synthesize(
+                text=text, 
+                lang=lang_tag, 
+                voice_style=voice_style,
+                total_steps=8,  # Default medium quality
+                speed=1.0
+            )
+        
+        # Supertonic outputs a numpy array. Convert to 16-bit PCM WAV.
         buf = io.BytesIO()
         sample_rate = getattr(tts_engine, 'sample_rate', 44100)
         sf.write(buf, wav.squeeze(), sample_rate, format='WAV', subtype='PCM_16')
@@ -409,14 +407,6 @@ def _async_generate_tts(text, target_lang, cache_key, chunk_id=None, tenant_id=N
             # A newer request for this chunk is queued. Skip this obsolete one!
             tts_cache.pop(cache_key, None)
             return
-
-    # Transcription has higher priority than TTS.
-    # Wait up to 4 seconds for pending audio chunks to drain before starting
-    # synthesis. This prevents TTS from competing with Whisper for CPU cycles
-    # when there is still audio waiting to be transcribed.
-    deadline = time.time() + 4.0
-    while audio_stack.qsize() > 0 and time.time() < deadline:
-        time.sleep(0.2)
 
     try:
         audio_b64 = generate_tts_sync(text, target_lang)
@@ -531,13 +521,7 @@ def _next_payload():
     tenant_id, chunk_id, audiob64 = audio_stack.get()
     while True:
 
-        if hasattr(audio_stack, "mutex"):
-            with audio_stack.mutex:
-                has_newer = any(
-                    t == tenant_id and c == chunk_id
-                    for (t, c, _) in audio_stack.queue
-                )
-        else:
+        with audio_stack.mutex:
             has_newer = any(
                 t == tenant_id and c == chunk_id
                 for (t, c, _) in audio_stack.queue
@@ -584,9 +568,8 @@ def process_audio():
                     if current_transcript:
                         # buffer for the same chunk, so overwrite rather than concatenate.
                         current_transcript['transcript'] = transcript
-                        current_transcript['last_update'] = time.time()
                     else:
-                        transcripts[chunk_id] = {'transcript': transcript, 'last_update': time.time()}
+                        transcripts[chunk_id] = {'transcript': transcript}
             else:
                 logger.warning(f"INVALID transcript for chunk_id {chunk_id}: {transcript}")
 
@@ -1330,12 +1313,12 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
     last_translation_time = 0.0
     sent_audio = {}
     loop_counter = 0
+    # Pending async translation futures: {cid: (future, source_text)}
     pending_translations = {}
-
-    chunk_last_text = {}     
-    chunk_stable_since = {}  
-    TEXT_STABLE_SECS = 2.0    
-
+    # Track when each chunk's text last changed (for stability debounce)
+    chunk_last_text = {}      # cid -> last seen text
+    chunk_stable_since = {}   # cid -> time.time() when text last changed
+    TEXT_STABLE_SECS = 2.0    # Wait for text to stop changing before translating
 
     while True:
         loop_counter += 1
@@ -1350,41 +1333,33 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
             tenant_transcripts = dict(transcriptd.get(tenant_id, {}))
 
         now = time.time()
-        # No global throttle
+        # No global throttle — translations are already gated to finalized chunks only
         can_translate = True
-
-
 
         events_to_send = []
 
-        sorted_cids = _numeric_sorted_keys(tenant_transcripts)
-        max_cid = sorted_cids[-1] if sorted_cids else None
-
-        for cid in sorted_cids:
+        for cid in _numeric_sorted_keys(tenant_transcripts):
             cid_int = _chunk_id_int(cid)
             if cid_int >= last_chunk_id:
                 text = tenant_transcripts[cid]['transcript']
                 is_final = (cid != max_cid)
 
+                # --- Text stability tracking ---
+                # Update stable-since timer any time the text changes for this chunk.
+                # We only translate once the text has been unchanged for TEXT_STABLE_SECS.
                 if chunk_last_text.get(cid) != text:
                     chunk_last_text[cid] = text
                     chunk_stable_since[cid] = now
-                    
+                    # If text changed while a translation was already pending,
+                    # cancel it so we re-translate with the newer, fuller text.
                     if cid in pending_translations:
                         old_fut, _ = pending_translations.pop(cid)
-                        old_fut.cancel()  
-
+                        old_fut.cancel()  # best-effort; may already be running
 
                 text_is_stable = (now - chunk_stable_since.get(cid, now)) >= TEXT_STABLE_SECS
 
                 needs_tx_update = sent_transcripts.get(cid) != text
-                # Only translate finalized chunks whose text has been stable long enough.
-                needs_tl_update = (
-                    target_lang
-                    and is_final
-                    and text_is_stable
-                    and (translated_transcripts.get(cid) != text)
-                )
+                needs_tl_update = target_lang and (translated_transcripts.get(cid) != text)
 
                 translation = last_translations.get(cid, "")
                 newly_translated = False
@@ -1397,7 +1372,12 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         del pending_translations[cid]
                         try:
                             new_tl = fut.result()
-
+                            # CRITICAL STALENESS CHECK:
+                            # Future.cancel() is best-effort — if the translation was already
+                            # running when the text changed, cancel() returns False silently
+                            # and the future completes with OLD partial text. We MUST discard
+                            # stale results here or the client will play the partial TTS and
+                            # then block all future audio for this chunk via playedChunkIds.
                             if pending_text != text:
                                 logger.debug(
                                     f"[TTS] Discarding stale translation for chunk {cid}: "
@@ -1412,7 +1392,6 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                                 last_translation_time = time.time()
                                 needs_tl_update = False  # Already translated
                                 newly_translated = True
-
                         except Exception as e:
                             logger.error(f"Async translation error for {tenant_id}/{cid}: {e}")
 
@@ -1434,12 +1413,10 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                     except Exception as e:
                         logger.error(f"Stream translation submit error for {tenant_id}: {e}")
 
-
                 # Send transcript updates in real time.
                 # Send translation update only when it *just* arrived (newly_translated).
                 # This prevents sending the same translation text on every loop iteration.
                 is_ready_update = needs_tx_update or newly_translated
-
 
                 needs_audio_update = False
                 audio_b64 = None
@@ -1452,35 +1429,27 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         cache_key = (lang_to_speak, tts_text)
                         cached_audio = tts_cache.get(cache_key)
 
-
                         if cached_audio in ('pending', 'failed'):
                             pass
                         elif cached_audio is not None:
                             audio_b64 = cached_audio
                             needs_audio_update = True
-                        else:
-                            # Not in cache and not pending. Submit it if it just became final/translated.
-                            # For target_lang, we wait for newly_translated. For no translation, we submit immediately on is_final.
-                            if (target_lang and newly_translated) or (not target_lang):
-                                if len(tts_text) > 300:
-                                    tts_text = tts_text[:297] + "..."
-                                latest_tts_requests[(tenant_id, cid)] = tts_text
-                                tts_cache[cache_key] = 'pending'
-                                tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
+                    else:
+                        latest_tts_requests[(tenant_id, cid)] = tts_text
+                        tts_cache[cache_key] = 'pending'
+                        tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
 
 
                 if is_ready_update or needs_audio_update:
                     payload = {
                         "chunk_id": cid,
                         "transcript": text,
-                        # Only include translation in the payload when it has been finalized.
-                        # For in-progress chunks, omit it so the UI keeps the previous translation visible.
-                        "translation": translation if (is_final or not target_lang) else "",
+                        "translation": translation,
                     }
-
+                    
                     if needs_audio_update and audio_b64:
                         payload["audio_b64"] = audio_b64
-                        sent_audio[cid] = translation or text
+                        sent_audio[cid] = tts_text
 
                     events_to_send.append(payload)
                     sent_transcripts[cid] = text
@@ -2197,12 +2166,6 @@ def redirect_root():
     """Intercept bare root URL and redirect to home."""
     if request.path == "/":
         return redirect(url_for("home"))
-
-
-@app.route('/favicon.ico')
-def favicon():
-    """Return empty 204 for favicon requests to suppress 404 log spam."""
-    return '', 204
 
 
 @app.route("/home")

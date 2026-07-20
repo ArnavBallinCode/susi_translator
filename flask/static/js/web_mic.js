@@ -14,7 +14,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const RATE = 16000;
     const CHUNK_SIZE = RATE;
     const BUFFER_SIZE = 10 * RATE;
+
     const SILENCE_THRESHOLD = 150 / 32768;
+
 
     const micWave1 = document.getElementById('mic-wave-1');
     const micWave2 = document.getElementById('mic-wave-2');
@@ -51,9 +53,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function startStream(stream) {
         audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE });
-        if (audioContext.state === 'suspended') {
-            audioContext.resume();
-        }
         mediaStream = stream;
         const mediaStreamSource = audioContext.createMediaStreamSource(stream);
         analyser = audioContext.createAnalyser();
