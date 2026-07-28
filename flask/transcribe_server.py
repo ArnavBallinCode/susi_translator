@@ -283,10 +283,7 @@ _supertonic_tts = None
 _tts_lock = threading.Lock()
 tts_inference_lock = threading.Lock()
 tts_executor = ThreadPoolExecutor(max_workers=1)
-<<<<<<< HEAD
 
-=======
->>>>>>> ae197b5 (all working fine local)
 class SizeBoundedTTSCache:
     def __init__(self, max_size_bytes=50 * 1024 * 1024):
         self.cache = OrderedDict()
