@@ -1250,8 +1250,8 @@ def configure_provider():
             if venv_bin not in existing_path.split(os.pathsep):
                 grabber_env["PATH"] = venv_bin + os.pathsep + existing_path
 
-            # Only applicable for the youtube source.
-            if stream_type == "youtube":
+            # Only applicable for the platform source.
+            if stream_type == "platform":
                 cookies_path = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), "instance", "youtubecookies.txt"
                 )
@@ -1417,6 +1417,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                             translation = new_tl
                             last_translations[cid] = translation
                             translated_transcripts[cid] = text
+                            newly_translated = True
                         last_translation_time = time.time()
                         can_translate = False  # Only 1 translation per loop to spread load
 
