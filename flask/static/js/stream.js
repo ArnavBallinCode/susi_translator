@@ -199,7 +199,6 @@ document.addEventListener('DOMContentLoaded', () => {
         return qs;
     }
 
-<<<<<<< HEAD
     function buildSseUrl(targetLang) {
         let url = `/api/v1/translate/stream?tenant_id=${TENANT_ID}&source=${encodeURIComponent(STREAM_TYPE)}&last_chunk_id=${lastChunkId}&audio=${playAudio}`;
         if (targetLang) {
@@ -208,12 +207,6 @@ document.addEventListener('DOMContentLoaded', () => {
             url += `&target_lang=original`;
         }
         return url;
-=======
-
-
-    function buildSseUrl(targetLang) {
-        return `/api/v1/translate/stream?${buildQueryString(targetLang)}`;
->>>>>>> 1d43c70 (added patch after rebasing)
     }
 
     function buildWsUrl(targetLang) {

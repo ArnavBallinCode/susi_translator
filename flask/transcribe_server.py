@@ -81,6 +81,8 @@ from auth.admin_panel import SecureModelView, SecureAdminIndexView
 
 from providers.registry import ProviderRegistry
 import providers.plugins 
+from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from audio_sources import URLSource, PlatformSource
 
@@ -177,9 +179,10 @@ app.config["JWT_COOKIE_SAMESITE"] = os.getenv("JWT_COOKIE_SAMESITE", "Lax")
 #match CSRF protection to whether HTTPS is enabled
 # Operators can override explicitly via JWT_COOKIE_CSRF_PROTECT=true/false.
 _https_mode: bool = app.config["JWT_COOKIE_SECURE"]
-app.config["JWT_COOKIE_CSRF_PROTECT"] = _env_bool(
-    "JWT_COOKIE_CSRF_PROTECT", default=_https_mode
-)
+app.config['JWT_COOKIE_CSRF_PROTECT'] = _env_bool('JWT_COOKIE_CSRF_PROTECT', True)
+
+# Apply ProxyFix so Flask trusts X-Forwarded-For headers from Nginx
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 # 10MB max upload size limit for OOM protection

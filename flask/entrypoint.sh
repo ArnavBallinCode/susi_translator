@@ -11,7 +11,7 @@ import ssl
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import time
 
-ssl._create_default_https_context = ssl._create_unverified_context
+
 for attempt in range(3):
     try:
         print(f'Loading models (attempt {attempt+1}/3)...')
