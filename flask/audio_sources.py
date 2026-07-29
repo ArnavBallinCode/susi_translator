@@ -4,18 +4,103 @@ Audio source abstractions for the SUSI Translator audio grabber
 
 from __future__ import annotations
 
+import ipaddress
+import re
+import socket
 import subprocess
 import sys
 import time
 import queue
+import urllib.request
 from abc import ABC, abstractmethod
 from typing import Generator, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 _ALLOWED_URL_SCHEMES: frozenset[str] = frozenset({"http", "https"})
-_FFMPEG_PROTOCOL_WHITELIST: str = "http,https,tcp,tls,crypto"
+_FFMPEG_PROTOCOL_WHITELIST: str = "http,https,tcp,tls,crypto,file,applehttp,hls"
 # deliberately *not* including ``http``/``https`` means a malicious upstream can't trick ffmpeg into chasing arbitrary URLs.
 _FFMPEG_PROTOCOL_WHITELIST_PIPE: str = "pipe,crypto"
+
+# Regex that matches any URI-like value inside an HLS manifest line.
+# Covers: #EXT-X-KEY:...,URI="...", #EXT-X-MAP:URI="...", bare segment lines.
+_HLS_URI_RE = re.compile(r'URI="([^"]+)"')
+
+
+def _is_safe_url(url: str) -> bool:
+    """
+    Returns True if the URL is a safe external http/https URL
+    """
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in _ALLOWED_URL_SCHEMES:
+            return False
+        if not parsed.hostname:
+            return False
+        ip = socket.gethostbyname(parsed.hostname)
+        ip_obj = ipaddress.ip_address(ip)
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def validate_hls_manifest(manifest_url: str, timeout: int = 10) -> None:
+    """
+    Validate an HLS .m3u8 manifest URL against SSRF attacks
+    """
+    import logging
+    _log = logging.getLogger(__name__)
+
+    if not _is_safe_url(manifest_url):
+        raise ValueError(
+            f"HLS manifest URL {manifest_url!r} resolves to a restricted or "
+            "private address. Submission rejected."
+        ) 
+    try:
+        import requests
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        resp = requests.get(manifest_url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        raw = resp.text[:1_000_000]  # 1 MB cap
+    except Exception as exc:
+        _log.warning(
+            "HLS manifest deep-scan skipped (server rejected our fetch — "
+            "ffmpeg would also fail to play this stream): %s", exc
+        )
+        return
+
+    base = manifest_url
+    unsafe: list[str] = []
+
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#EXT") is False and line.startswith("#"):
+            # Skip pure comment lines; process EXT-X-* tags and plain lines.
+            if line.startswith("#") and not line.startswith("#EXT"):
+                continue
+
+        for m in _HLS_URI_RE.finditer(line):
+            uri = m.group(1).strip()
+            if uri:
+                absolute = uri if urlparse(uri).scheme else urljoin(base, uri)
+                if not _is_safe_url(absolute):
+                    unsafe.append(absolute)
+
+        if not line.startswith("#") and line:
+            absolute = line if urlparse(line).scheme else urljoin(base, line)
+            if not _is_safe_url(absolute):
+                unsafe.append(absolute)
+
+    if unsafe:
+        # Show only the first offender to avoid leaking internal topology.
+        raise ValueError(
+            f"HLS manifest contains a URI that resolves to a restricted address "
+            f"({unsafe[0]!r}). Submission rejected."
+        )
 
 
 def _read_up_to(stream, n: int) -> bytes:
@@ -195,7 +280,11 @@ class URLSource(AudioSource):
     def _validate_url(url: str) -> str:
         """
         Validate that the URL is a safe HTTP/HTTPS network URL before passing it to ffmpeg.
+        Also resolves the hostname to ensure it does not point to a private/internal IP (SSRF protection).
         """
+        import socket
+        import ipaddress
+
         if not isinstance(url, str) or not url:
             raise ValueError("URLSource: url must be a non-empty string")
         # Reject anything that could be parsed as an option flag by ffmpeg
@@ -207,8 +296,18 @@ class URLSource(AudioSource):
                 f"URLSource: unsupported URL scheme {parsed.scheme!r}; "
                 f"allowed schemes are {sorted(_ALLOWED_URL_SCHEMES)}"
             )
-        if not parsed.netloc:
+        if not parsed.hostname:
             raise ValueError("URLSource: url must include a host")
+            
+        # SSRF Protection: Resolve the hostname and ensure it's not a private/internal IP
+        try:
+            ip = socket.gethostbyname(parsed.hostname)
+            ip_obj = ipaddress.ip_address(ip)
+            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local:
+                raise ValueError(f"URLSource: URL resolves to a restricted internal IP address ({ip}).")
+        except socket.gaierror:
+            raise ValueError(f"URLSource: Failed to resolve hostname '{parsed.hostname}'.")
+            
         return url
 
     def start(self) -> None:
@@ -216,6 +315,7 @@ class URLSource(AudioSource):
         cmd = [
             "ffmpeg",
             "-loglevel", "error",
+            "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "-protocol_whitelist", _FFMPEG_PROTOCOL_WHITELIST,
             "-i", self._url,
             "-f", "s16le",
@@ -227,10 +327,12 @@ class URLSource(AudioSource):
         # nosemgrep: python.lang.security.audit.dangerous-subprocess-use-audit
         # Safe: self._url is validated by _validate_url() (scheme whitelist,
         # no leading '-', host required); argv is a fixed list with shell=False.
+        # stderr is inherited (not DEVNULL) so ffmpeg errors appear in the
+        # grabber log file that the server creates per-tenant.
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=sys.stderr,
             shell=False,
         )
         self._running = True
@@ -267,14 +369,7 @@ class URLSource(AudioSource):
 
 class StdinSource(AudioSource):
     """
-    Read raw 16 kHz, 16-bit mono PCM audio from stdin.
-
-    Example:
-        ffmpeg -i input.flac -f s16le -ac 1 -ar 16000 - | \
-            python audio_grabber.py stdin --server http://localhost:5040
-
-    The input must already be in the required PCM format; no decoding or
-    resampling is performed.
+    Read raw 16 kHz, 16-bit mono PCM audio from stdin
     """
 
     def __init__(self) -> None:
@@ -304,11 +399,7 @@ class StdinSource(AudioSource):
 class PlatformSource(AudioSource):
     """
     Decode a platform (YouTube/Twitch/Vimeo) URL by getting the URL from ``yt-dlp`` into ``ffmpeg``.
-    by chaining two subprocesses::
-
-        yt-dlp -f <fmt> -o - <url>  |  ffmpeg -i pipe:0 ... -f s16le -
-
-    See the README for requirements (yt-dlp + ffmpeg on PATH) and cookie-based auth.
+    by chaining two subprocesses
     """
 
     _ALLOWED_HOSTS: frozenset[str] = frozenset({
@@ -391,16 +482,20 @@ class PlatformSource(AudioSource):
         ydl_argv += ["--", self._watch_url]
 
         try:
-            url_output = subprocess.check_output(
+            result = subprocess.run(
                 ydl_argv,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                shell=False
+                shell=False,
+                check=True,
             )
+            url_output = result.stdout
         except subprocess.CalledProcessError as exc:
-            stderr_msg = (exc.stderr or "").strip()
-            detail = f": {stderr_msg}" if stderr_msg else ""
-            raise RuntimeError(f"yt-dlp failed to get URL{detail}")
+            stderr_msg = exc.stderr.strip() if exc.stderr else "(no stderr)"
+            raise RuntimeError(
+                f"yt-dlp failed (exit {exc.returncode}): {stderr_msg}"
+            )
 
         lines = [line.strip() for line in url_output.splitlines() if line.strip()]
         if not lines:

@@ -1145,14 +1145,25 @@ def configure_provider():
         stream_url = data.get("stream_url")
         stream_type = data.get("stream_type", "platform")
 
+        if stream_url and stream_type == "platform":
+            base_url = stream_url.split('?')[0].lower()
+            if base_url.endswith('.m3u8') or base_url.endswith('.m3u'):
+                stream_type = "url"
+
         # Validation phase
         if stream_url:
             if stream_type == "platform":
                 PlatformSource._validate_url(stream_url)
             elif stream_type == "url":
-                if not organizer or not organizer.is_admin:
-                    return jsonify({"status": "error", "message": "Only admins can provide direct stream URLs."}), 403
+                base_url = stream_url.split('?')[0].lower()
+                is_hls = base_url.endswith('.m3u8') or base_url.endswith('.m3u')
+                if not is_hls and (not organizer or not organizer.is_admin):
+                    return jsonify({"status": "error", "message": "Only admins can provide direct stream URLs (unless it is an HLS .m3u8 stream)."}), 403
                 URLSource._validate_url(stream_url)
+                if is_hls:
+                    from audio_sources import validate_hls_manifest
+                    validate_hls_manifest(stream_url)
+
             elif stream_type == "file":
                 if not os.path.exists(stream_url):
                     return jsonify({"status": "error", "message": "File not found"}), 400
@@ -1219,8 +1230,17 @@ def configure_provider():
                 cmd.append("--realtime")
             elif stream_type in ("url", "platform"):
                 cmd.extend(["--url", stream_url])
-
-            safe_env_keys = {"PATH", "LANG", "LC_ALL", "USER", "HOME", "PYTHONPATH", "VIRTUAL_ENV"}
+            # Pass the auth token via environment variable
+            # Explicitly construct a minimal environment to avoid leaking
+            # sensitive parent vars to the subprocess.
+            safe_env_keys = {
+                "PATH", "LANG", "LC_ALL", "USER", "HOME", "PYTHONPATH",
+                "VIRTUAL_ENV",
+                # uv-specific vars so the virtualenv is correctly inherited
+                "UV_PROJECT_ROOT", "UV_PYTHON", "UV_TOOL_DIR",
+                # pass through SSL verify setting
+                "FLASK_SSL_VERIFY",
+            }
             grabber_env = {k: os.environ[k] for k in safe_env_keys if k in os.environ}
             grabber_env["GRABBER_AUTH_TOKEN"] = internal_token
 
@@ -1230,8 +1250,8 @@ def configure_provider():
             if venv_bin not in existing_path.split(os.pathsep):
                 grabber_env["PATH"] = venv_bin + os.pathsep + existing_path
 
-            # Only applicable for the youtube source.
-            if stream_type == "youtube":
+            # Only applicable for the platform source.
+            if stream_type == "platform":
                 cookies_path = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), "instance", "youtubecookies.txt"
                 )
@@ -1241,11 +1261,18 @@ def configure_provider():
 
             # Spawn BEFORE committing to DB so a spawn failure doesn't leave
             # configured=True in the DB with no active grabber process.
+            log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "instance")
+            os.makedirs(log_dir, exist_ok=True)
+            grabber_log_path = os.path.join(log_dir, f"grabber_{tenant_id[:8]}.log")
+            grabber_log_file = open(grabber_log_path, "w", buffering=1)  # line-buffered
+            logger.info(f"Grabber output → {grabber_log_path}")
             proc = subprocess.Popen(
                 cmd,
                 cwd=os.path.dirname(os.path.abspath(__file__)),
                 start_new_session=True,
                 env=grabber_env,
+                stdout=grabber_log_file,
+                stderr=grabber_log_file,
             )
             with grabber_lock:
                 grabber_processes[tenant_id] = proc
@@ -1390,6 +1417,7 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                             translation = new_tl
                             last_translations[cid] = translation
                             translated_transcripts[cid] = text
+                            newly_translated = True
                         last_translation_time = time.time()
                         can_translate = False  # Only 1 translation per loop to spread load
 
@@ -1458,6 +1486,12 @@ def translate_stream():
         return jsonify({"status": "error", "message": "Missing 'tenant_id'"}), 400
 
     _assert_tenant_ownership(tenant_id)
+    target_lang = request.args.get('target_lang')
+    if target_lang == 'original':
+        target_lang = None
+    elif not target_lang:
+        target_lang = registry.get_language_config(tenant_id).get('target_lang')
+    last_chunk_id = _parse_int_arg(request.args, 'last_chunk_id', default=0)
 
     with stream_connections_lock:
         current_connections = stream_connections.get(tenant_id, 0)
@@ -1591,6 +1625,8 @@ def translate_stream():
                         del stream_connections[tenant_id]
 
     return Response(event_stream(), mimetype="text/event-stream")
+
+
 
 
 # WebSocket streaming endpoint 

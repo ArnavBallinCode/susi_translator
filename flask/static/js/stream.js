@@ -97,6 +97,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // Pause stream, stop receiving/rendering new chunks while audio is paused
             fileAudioPaused = true;
             if (wsSocket) {
+                intentionalClose = true;  // tell onclose not to reconnect via SSE
                 try { wsSocket.close(); } catch (_) {}
                 wsSocket = null;
             }
@@ -116,8 +117,28 @@ document.addEventListener('DOMContentLoaded', () => {
         const ytId = extractYtId(VIDEO_URL);
         const twitchId = extractTwitchId(VIDEO_URL);
         const vimeoId = extractVimeoId(VIDEO_URL);
+        const isHls = VIDEO_URL.split('?')[0].toLowerCase().endsWith('.m3u8') || VIDEO_URL.split('?')[0].toLowerCase().endsWith('.m3u');
         
-        if (ytId) {
+        if (isHls) {
+            ytPlayer.style.display = 'none';
+            const hlsPlayer = document.getElementById('hls-player');
+            hlsPlayer.style.display = 'block';
+            
+            if (Hls.isSupported()) {
+                const hls = new Hls();
+                hls.loadSource(VIDEO_URL);
+                hls.attachMedia(hlsPlayer);
+                hls.on(Hls.Events.MANIFEST_PARSED, function() {
+                    hlsPlayer.play().catch(e => console.log("Auto-play prevented", e));
+                });
+            } else if (hlsPlayer.canPlayType('application/vnd.apple.mpegurl')) {
+                // Native HLS support (Safari)
+                hlsPlayer.src = VIDEO_URL;
+                hlsPlayer.addEventListener('loadedmetadata', function() {
+                    hlsPlayer.play().catch(e => console.log("Auto-play prevented", e));
+                });
+            }
+        } else if (ytId) {
             ytPlayer.src = `https://www.youtube.com/embed/${ytId}?autoplay=1&mute=1`;
         } else if (twitchId) {
             const currentHost = window.location.hostname;
@@ -145,6 +166,9 @@ document.addEventListener('DOMContentLoaded', () => {
     let wsSocket = null;       // active WebSocket connection (primary)
     let usingWebSocket = false;
     let lastChunkId = 0;
+    // Set to true just before we intentionally close the WS (e.g. on pause)
+    // so onclose knows not to trigger the SSE fallback reconnect.
+    let intentionalClose = false;
 
     // For file streams: block rendering while WaveSurfer is paused
     let fileAudioPaused = (STREAM_TYPE === 'file');
@@ -177,6 +201,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return qs;
     }
 
+<<<<<<< HEAD
     function buildSseUrl(targetLang) {
         let url = `/api/v1/translate/stream?tenant_id=${TENANT_ID}&source=${encodeURIComponent(STREAM_TYPE)}&last_chunk_id=${lastChunkId}&audio=${playAudio}`;
         if (targetLang) {
@@ -185,6 +210,12 @@ document.addEventListener('DOMContentLoaded', () => {
             url += `&target_lang=original`;
         }
         return url;
+=======
+
+
+    function buildSseUrl(targetLang) {
+        return `/api/v1/translate/stream?${buildQueryString(targetLang)}`;
+>>>>>>> 1d43c70 (added patch after rebasing)
     }
 
     function buildWsUrl(targetLang) {
@@ -207,10 +238,14 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Track the highest chunk received for reconnect continuity
-        const chunkInt = parseInt(data.chunk_id, 10);
-        if (!isNaN(chunkInt) && chunkInt > lastChunkId) {
-            lastChunkId = chunkInt;
+        // Track the highest chunk received for reconnect continuity.
+        // Only advance while NOT paused — paused chunks must not shift the
+        // cursor forward or they will be skipped permanently on resume.
+        if (!fileAudioPaused) {
+            const chunkInt = parseInt(data.chunk_id, 10);
+            if (!isNaN(chunkInt) && chunkInt > lastChunkId) {
+                lastChunkId = chunkInt;
+            }
         }
 
         // For file streams: drop renders when audio is paused to stay in sync
@@ -362,6 +397,13 @@ document.addEventListener('DOMContentLoaded', () => {
         currentWs.onclose = (event) => {
             if (wsSocket !== currentWs) return;
 
+            // Pause handler intentionally closed this socket — do not reconnect.
+            if (intentionalClose) {
+                intentionalClose = false;
+                wsSocket = null;
+                return;
+            }
+
             if (!wsConnected) {
                 // The connection was never established — fall back to SSE immediately
                 console.info('[stream] WebSocket upgrade failed (code', event.code, ') — falling back to SSE');
@@ -446,6 +488,13 @@ document.addEventListener('DOMContentLoaded', () => {
             
             const chosen = langSelect.value;
             localStorage.setItem(`susi_lang_${TENANT_ID}`, chosen);
+            
+            if (!chosen) {
+                document.querySelectorAll('.translation-text').forEach(el => {
+                    el.style.display = 'none';
+                });
+            }
+            
             connect();
         });
     }
