@@ -1,7 +1,7 @@
 [project]
 name = "susi-translator"
 version = "0.1.0"
-description = "Real-time transcription and translation prototype with Django and Flask backends."
+description = "Real-time transcription and translation prototype with Flask backends."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -43,12 +43,12 @@ dependencies = [
     "flask-talisman>=1.1.0",
     "gunicorn>=22.0.0",
     "gevent>=24.0.0",
-    "psycopg2-binary>=2.9",
+    
    
     "nvidia-cublas-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "nvidia-cuda-runtime-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "nvidia-cudnn-cu12; sys_platform == 'linux' and platform_machine == 'x86_64'",
-
+    "psycopg2-binary>=2.9.9",
 ]
 
 [tool.uv]

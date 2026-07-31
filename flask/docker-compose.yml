@@ -1,0 +1,110 @@
+
+services:
+  db:
+    image: postgres:15.7
+    container_name: susi_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - susi_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: susi_redis
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - susi_net
+
+  web:
+    build:
+      context: ..
+      dockerfile: flask/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    image: susi_flask_app
+    container_name: susi_web
+    restart: always
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      - OMP_NUM_THREADS=2
+      - MKL_NUM_THREADS=2
+      - NUMEXPR_NUM_THREADS=2
+      - TOKENIZERS_PARALLELISM=false
+      - XDG_CACHE_HOME=/app/.cache
+    volumes:
+      - ./instance:/app/instance
+      - model_cache:/app/.cache
+    deploy:
+      resources:
+        limits:
+          memory: 6G
+        reservations:
+          memory: 512M
+    expose:
+      - "5040"
+    networks:
+      - susi_net
+
+  nginx:
+    build:
+      context: ./deployment/nginx
+      dockerfile: Dockerfile.nginx
+    container_name: susi_nginx
+    restart: always
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deployment/nginx/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
+      - ./static:/app/static:ro
+      - certbot_certs:/etc/letsencrypt
+    depends_on:
+      - web
+    networks:
+      - susi_net
+
+  certbot:
+    image: certbot/certbot
+    container_name: susi_certbot
+    restart: on-failure
+    environment:
+      DOMAIN_NAME: ${DOMAIN_NAME}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL}
+      DNS_TOKEN: ${DNS_TOKEN}
+    volumes:
+      - ./deployment/certbot:/opt/certbot-scripts
+      - certbot_certs:/etc/letsencrypt
+    entrypoint: ["/bin/sh", "/opt/certbot-scripts/certbot_entrypoint.sh"]
+    depends_on:
+      - nginx
+    networks:
+      - susi_net
+
+networks:
+  susi_net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: 1350
+
+volumes:
+  model_cache:
+  certbot_certs:
+  pgdata:
+  redis_data:

@@ -81,6 +81,8 @@ from auth.admin_panel import SecureModelView, SecureAdminIndexView
 
 from providers.registry import ProviderRegistry
 import providers.plugins 
+from dotenv import load_dotenv
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from audio_sources import URLSource, PlatformSource
 
@@ -177,9 +179,10 @@ app.config["JWT_COOKIE_SAMESITE"] = os.getenv("JWT_COOKIE_SAMESITE", "Lax")
 #match CSRF protection to whether HTTPS is enabled
 # Operators can override explicitly via JWT_COOKIE_CSRF_PROTECT=true/false.
 _https_mode: bool = app.config["JWT_COOKIE_SECURE"]
-app.config["JWT_COOKIE_CSRF_PROTECT"] = _env_bool(
-    "JWT_COOKIE_CSRF_PROTECT", default=_https_mode
-)
+app.config['JWT_COOKIE_CSRF_PROTECT'] = _env_bool('JWT_COOKIE_CSRF_PROTECT', True)
+
+# Apply ProxyFix so Flask trusts X-Forwarded-For headers from Nginx
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(days=7)
 app.config["MAX_CONTENT_LENGTH"] = 10 * 1024 * 1024 # 10MB max upload size limit for OOM protection
@@ -278,12 +281,13 @@ latest_session_by_source = {s: None for s in VALID_SOURCES}
 session_lock = threading.Lock()
 SESSION_TTL_SECONDS = int(os.getenv('SESSION_TTL_SECONDS', '7200'))
 
-#TTS
+#TTS 
 _supertonic_tts = None
 _tts_lock = threading.Lock()
 tts_inference_lock = threading.Lock()
 tts_executor = ThreadPoolExecutor(max_workers=1)
-translation_executor = ThreadPoolExecutor(max_workers=1)
+tl_executor = ThreadPoolExecutor(max_workers=2)
+
 class SizeBoundedTTSCache:
     def __init__(self, max_size_bytes=50 * 1024 * 1024):
         self.cache = OrderedDict()
@@ -343,6 +347,8 @@ def get_tts_engine():
             if _supertonic_tts is None:
                 from supertonic import TTS
                 _supertonic_tts = TTS(auto_download=True)
+                providers = getattr(_supertonic_tts.model.vocoder_ort, 'get_providers', lambda: ['Unknown'])()
+                logger.info(f"[supertonic] TTS initialized. Active ONNX Providers: {providers}")
     return _supertonic_tts
 
 SUPERTONIC_SUPPORTED_LANGS = {
@@ -377,18 +383,17 @@ def generate_tts_sync(text, target_lang):
         # Get voice style, fallback to F1 if not mapped
         style_name = TTS_VOICE_STYLES.get(target_lang, "F1")
         voice_style = tts_engine.get_voice_style(voice_name=style_name)
-        try:
-            with tts_inference_lock:
-                wav, duration = tts_engine.synthesize(
-                    text=text, 
-                    lang=lang_tag, 
-                    voice_style=voice_style,
-                    total_steps=8,  # Default medium quality
-                    speed=1.0
-                )
-        except Exception as e:
-            logger.error(f"Synthesis failed: {e}")
-            raise
+        
+        with tts_inference_lock:
+            wav, duration = tts_engine.synthesize(
+                text=text, 
+                lang=lang_tag, 
+                voice_style=voice_style,
+                total_steps=8,  # Default medium quality
+                speed=1.0
+            )
+        
+        # Supertonic outputs a numpy array. Convert to 16-bit PCM WAV.
         buf = io.BytesIO()
         sample_rate = getattr(tts_engine, 'sample_rate', 44100)
         sf.write(buf, wav.squeeze(), sample_rate, format='WAV', subtype='PCM_16')
@@ -405,14 +410,6 @@ def _async_generate_tts(text, target_lang, cache_key, chunk_id=None, tenant_id=N
             # A newer request for this chunk is queued. Skip this obsolete one!
             tts_cache.pop(cache_key, None)
             return
-
-    # Transcription has higher priority than TTS.
-    # Wait up to 4 seconds for pending audio chunks to drain before starting
-    # synthesis. This prevents TTS from competing with Whisper for CPU cycles
-    # when there is still audio waiting to be transcribed.
-    deadline = time.time() + 4.0
-    while audio_stack.qsize() > 0 and time.time() < deadline:
-        time.sleep(0.2)
 
     try:
         audio_b64 = generate_tts_sync(text, target_lang)
@@ -527,13 +524,7 @@ def _next_payload():
     tenant_id, chunk_id, audiob64 = audio_stack.get()
     while True:
 
-        if hasattr(audio_stack, "mutex"):
-            with audio_stack.mutex:
-                has_newer = any(
-                    t == tenant_id and c == chunk_id
-                    for (t, c, _) in audio_stack.queue
-                )
-        else:
+        with audio_stack.mutex:
             has_newer = any(
                 t == tenant_id and c == chunk_id
                 for (t, c, _) in audio_stack.queue
@@ -580,9 +571,8 @@ def process_audio():
                     if current_transcript:
                         # buffer for the same chunk, so overwrite rather than concatenate.
                         current_transcript['transcript'] = transcript
-                        current_transcript['last_update'] = time.time()
                     else:
-                        transcripts[chunk_id] = {'transcript': transcript, 'last_update': time.time()}
+                        transcripts[chunk_id] = {'transcript': transcript}
             else:
                 logger.warning(f"INVALID transcript for chunk_id {chunk_id}: {transcript}")
 
@@ -805,6 +795,7 @@ def _session_logic(success_status: int = 200):
         from auth.models import Organizer, Room, db
         verify_jwt_in_request(optional=True)
         email = get_jwt_identity()
+        logger.warning(f"[Session Debug] email={email}, request_cookies={request.cookies.keys()}")
         if email:
             organizer = Organizer.query.filter_by(email=email).first()
             if organizer:
@@ -819,7 +810,8 @@ def _session_logic(success_status: int = 200):
                 db.session.add(new_room)
                 db.session.commit()
                 logger.info(f"[Session] Room {new_tenant_id} saved to DB for organizer '{email}'")
-    except (JWTExtendedException, PyJWTError):
+    except (JWTExtendedException, PyJWTError) as exc:
+        logger.warning(f"[Session] Auth check skipped or failed: {exc.__class__.__name__}: {exc}")
         pass
     except Exception as e:
         logger.error(f"[Session] Failed to save room {new_tenant_id} to DB: {type(e).__name__}: {e}", exc_info=True)
@@ -1326,11 +1318,12 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
     last_translation_time = 0.0
     sent_audio = {}
     loop_counter = 0
+    # Pending async translation futures: {cid: (future, source_text)}
     pending_translations = {}
-    # Track when each chunk's text last changed 
-    chunk_last_text = {}     
-    chunk_stable_since = {}  
-    TEXT_STABLE_SECS = 2.0    
+    # Track when each chunk's text last changed (for stability debounce)
+    chunk_last_text = {}      # cid -> last seen text
+    chunk_stable_since = {}   # cid -> time.time() when text last changed
+    TEXT_STABLE_SECS = 2.0    # Wait for text to stop changing before translating
 
     while True:
         loop_counter += 1
@@ -1359,24 +1352,22 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                 text = tenant_transcripts[cid]['transcript']
                 is_final = (cid != max_cid)
 
+                # --- Text stability tracking ---
+                # Update stable-since timer any time the text changes for this chunk.
+                # We only translate once the text has been unchanged for TEXT_STABLE_SECS.
                 if chunk_last_text.get(cid) != text:
                     chunk_last_text[cid] = text
                     chunk_stable_since[cid] = now
-                    
+                    # If text changed while a translation was already pending,
+                    # cancel it so we re-translate with the newer, fuller text.
                     if cid in pending_translations:
                         old_fut, _ = pending_translations.pop(cid)
-                        old_fut.cancel()  
+                        old_fut.cancel()  # best-effort; may already be running
 
                 text_is_stable = (now - chunk_stable_since.get(cid, now)) >= TEXT_STABLE_SECS
 
                 needs_tx_update = sent_transcripts.get(cid) != text
-                # Only translate finalized chunks whose text has been stable long enough.
-                needs_tl_update = (
-                    target_lang
-                    and is_final
-                    and text_is_stable
-                    and (translated_transcripts.get(cid) != text)
-                )
+                needs_tl_update = target_lang and (translated_transcripts.get(cid) != text)
 
                 translation = last_translations.get(cid, "")
                 newly_translated = False
@@ -1389,6 +1380,12 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         del pending_translations[cid]
                         try:
                             new_tl = fut.result()
+                            # CRITICAL STALENESS CHECK:
+                            # Future.cancel() is best-effort — if the translation was already
+                            # running when the text changed, cancel() returns False silently
+                            # and the future completes with OLD partial text. We MUST discard
+                            # stale results here or the client will play the partial TTS and
+                            # then block all future audio for this chunk via playedChunkIds.
                             if pending_text != text:
                                 logger.debug(
                                     f"[TTS] Discarding stale translation for chunk {cid}: "
@@ -1412,12 +1409,11 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         lang_config = registry.get_language_config(tenant_id)
                         source_lang = lang_config.get('source_lang', 'en')
 
-                        new_tl = registry.translate(tenant_id, text, source_lang, target_lang)
-                        if new_tl is not None:
-                            translation = new_tl
-                            last_translations[cid] = translation
-                            translated_transcripts[cid] = text
-                            newly_translated = True
+                        fut = tl_executor.submit(
+                            registry.translate,
+                            tenant_id, text, source_lang, target_lang
+                        )
+                        pending_translations[cid] = (fut, text)
                         last_translation_time = time.time()
                         can_translate = False  # Only 1 translation per loop to spread load
 
@@ -1446,27 +1442,21 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                             audio_b64 = cached_audio
                             needs_audio_update = True
                         else:
-                            # Not in cache and not pending. Submit it if it just became final/translated.
-                            # For target_lang, we wait for newly_translated. For no translation, we submit immediately on is_final.
-                            if (target_lang and newly_translated) or (not target_lang):
-                                if len(tts_text) > 300:
-                                    tts_text = tts_text[:297] + "..."
-                                latest_tts_requests[(tenant_id, cid)] = tts_text
-                                tts_cache[cache_key] = 'pending'
-                                tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
+                            latest_tts_requests[(tenant_id, cid)] = tts_text
+                            tts_cache[cache_key] = 'pending'
+                            tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
+
 
                 if is_ready_update or needs_audio_update:
                     payload = {
                         "chunk_id": cid,
                         "transcript": text,
-                        # Only include translation in the payload when it has been finalized.
-                        # For in-progress chunks, omit it so the UI keeps the previous translation visible.
-                        "translation": translation if (is_final or not target_lang) else "",
+                        "translation": translation,
                     }
-
+                    
                     if needs_audio_update and audio_b64:
                         payload["audio_b64"] = audio_b64
-                        sent_audio[cid] = translation or text
+                        sent_audio[cid] = tts_text
 
                     events_to_send.append(payload)
                     sent_transcripts[cid] = text
@@ -2178,17 +2168,44 @@ def _require_login():
         return redirect(url_for("auth.login_page"))
 
 
+@app.route('/api/v1/debug/hardware', methods=['GET'])
+def debug_hardware():
+    """
+    Returns the current hardware acceleration status across the different inference engines.
+    """
+    import ctranslate2
+    
+    # Check CTranslate2 (Faster Whisper & NLLB-200)
+    ct2_gpus = ctranslate2.get_cuda_device_count()
+    ct2_status = f"CUDA (GPUs: {ct2_gpus})" if ct2_gpus > 0 else "CPU"
+    
+    # Check ONNX Runtime (Supertonic TTS)
+    try:
+        import onnxruntime as ort
+        ort_providers = ort.get_available_providers()
+        ort_status = ort_providers
+    except ImportError:
+        ort_status = ["Not Installed"]
+
+    return jsonify({
+        "status": "success",
+        "engines": {
+            "ctranslate2 (Whisper & NLLB)": {
+                "detected_device": ct2_status,
+                "cuda_device_count": ct2_gpus
+            },
+            "onnxruntime (Supertonic TTS)": {
+                "available_providers": ort_status
+            }
+        }
+    }), 200
+
+
 @app.before_request
 def redirect_root():
     """Intercept bare root URL and redirect to home."""
     if request.path == "/":
         return redirect(url_for("home"))
-
-
-@app.route('/favicon.ico')
-def favicon():
-    """Return empty 204 for favicon requests to suppress 404 log spam."""
-    return '', 204
 
 
 @app.route("/home")
