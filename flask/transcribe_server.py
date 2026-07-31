@@ -286,6 +286,7 @@ _supertonic_tts = None
 _tts_lock = threading.Lock()
 tts_inference_lock = threading.Lock()
 tts_executor = ThreadPoolExecutor(max_workers=1)
+tl_executor = ThreadPoolExecutor(max_workers=2)
 
 class SizeBoundedTTSCache:
     def __init__(self, max_size_bytes=50 * 1024 * 1024):
@@ -346,6 +347,8 @@ def get_tts_engine():
             if _supertonic_tts is None:
                 from supertonic import TTS
                 _supertonic_tts = TTS(auto_download=True)
+                providers = getattr(_supertonic_tts.model.vocoder_ort, 'get_providers', lambda: ['Unknown'])()
+                logger.info(f"[supertonic] TTS initialized. Active ONNX Providers: {providers}")
     return _supertonic_tts
 
 SUPERTONIC_SUPPORTED_LANGS = {
@@ -792,6 +795,7 @@ def _session_logic(success_status: int = 200):
         from auth.models import Organizer, Room, db
         verify_jwt_in_request(optional=True)
         email = get_jwt_identity()
+        logger.warning(f"[Session Debug] email={email}, request_cookies={request.cookies.keys()}")
         if email:
             organizer = Organizer.query.filter_by(email=email).first()
             if organizer:
@@ -806,7 +810,8 @@ def _session_logic(success_status: int = 200):
                 db.session.add(new_room)
                 db.session.commit()
                 logger.info(f"[Session] Room {new_tenant_id} saved to DB for organizer '{email}'")
-    except (JWTExtendedException, PyJWTError):
+    except (JWTExtendedException, PyJWTError) as exc:
+        logger.warning(f"[Session] Auth check skipped or failed: {exc.__class__.__name__}: {exc}")
         pass
     except Exception as e:
         logger.error(f"[Session] Failed to save room {new_tenant_id} to DB: {type(e).__name__}: {e}", exc_info=True)
@@ -1338,7 +1343,10 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
 
         events_to_send = []
 
-        for cid in _numeric_sorted_keys(tenant_transcripts):
+        sorted_cids = _numeric_sorted_keys(tenant_transcripts)
+        max_cid = sorted_cids[-1] if sorted_cids else None
+
+        for cid in sorted_cids:
             cid_int = _chunk_id_int(cid)
             if cid_int >= last_chunk_id:
                 text = tenant_transcripts[cid]['transcript']
@@ -1401,12 +1409,11 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         lang_config = registry.get_language_config(tenant_id)
                         source_lang = lang_config.get('source_lang', 'en')
 
-                        new_tl = registry.translate(tenant_id, text, source_lang, target_lang)
-                        if new_tl is not None:
-                            translation = new_tl
-                            last_translations[cid] = translation
-                            translated_transcripts[cid] = text
-                            newly_translated = True
+                        fut = tl_executor.submit(
+                            registry.translate,
+                            tenant_id, text, source_lang, target_lang
+                        )
+                        pending_translations[cid] = (fut, text)
                         last_translation_time = time.time()
                         can_translate = False  # Only 1 translation per loop to spread load
 
@@ -1434,10 +1441,10 @@ def _stream_caption_events(tenant_id, target_lang, last_chunk_id, wants_audio=Fa
                         elif cached_audio is not None:
                             audio_b64 = cached_audio
                             needs_audio_update = True
-                    else:
-                        latest_tts_requests[(tenant_id, cid)] = tts_text
-                        tts_cache[cache_key] = 'pending'
-                        tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
+                        else:
+                            latest_tts_requests[(tenant_id, cid)] = tts_text
+                            tts_cache[cache_key] = 'pending'
+                            tts_executor.submit(_async_generate_tts, tts_text, lang_to_speak, cache_key, cid, tenant_id)
 
 
                 if is_ready_update or needs_audio_update:
@@ -2159,6 +2166,39 @@ def _require_login():
         return None  # authenticated — let the view proceed
     except Exception:
         return redirect(url_for("auth.login_page"))
+
+
+@app.route('/api/v1/debug/hardware', methods=['GET'])
+def debug_hardware():
+    """
+    Returns the current hardware acceleration status across the different inference engines.
+    """
+    import ctranslate2
+    
+    # Check CTranslate2 (Faster Whisper & NLLB-200)
+    ct2_gpus = ctranslate2.get_cuda_device_count()
+    ct2_status = f"CUDA (GPUs: {ct2_gpus})" if ct2_gpus > 0 else "CPU"
+    
+    # Check ONNX Runtime (Supertonic TTS)
+    try:
+        import onnxruntime as ort
+        ort_providers = ort.get_available_providers()
+        ort_status = ort_providers
+    except ImportError:
+        ort_status = ["Not Installed"]
+
+    return jsonify({
+        "status": "success",
+        "engines": {
+            "ctranslate2 (Whisper & NLLB)": {
+                "detected_device": ct2_status,
+                "cuda_device_count": ct2_gpus
+            },
+            "onnxruntime (Supertonic TTS)": {
+                "available_providers": ort_status
+            }
+        }
+    }), 200
 
 
 @app.before_request

@@ -91,6 +91,13 @@ class FasterWhisperLocalProvider(TranscriptionProvider):
                     cpu_threads=4,
                 )
                 self._resolved_device = dev
+                
+                try:
+                    dummy_audio = np.zeros(16000, dtype=np.float32)
+                    list(self._model.transcribe(dummy_audio, beam_size=1, language="en", without_timestamps=True))
+                except Exception as warmup_e:
+                    logger.warning(f"[faster_whisper] Warmup failed: {warmup_e}")
+
                 logger.info(
                     f"[faster_whisper] Model '{self._model_size}' loaded successfully "
                     f"on device='{dev}' compute_type='{ctype}'."

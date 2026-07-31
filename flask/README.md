@@ -1,3 +1,5 @@
+<!-- markdownlint-disable MD013 -->
+
 # Susi Translator Flask App
 
 A real-time speech-to-text (transcription) HTTP API built with Flask + flask-restx. It accepts streamed audio chunks, transcribes them via Whisper, and exposes REST endpoints for clients to poll/consume the resulting text.
@@ -6,27 +8,7 @@ A real-time speech-to-text (transcription) HTTP API built with Flask + flask-res
 
 ## High-Level Architecture
 
-<<<<<<< HEAD
 ```text
-┌─────────────┐  POST /session    ┌──────────────────────────────────────┐
-│ audio_      │  POST /transcribe │  transcribe_server.py                │
-│ grabber.py  │ ────────────────> │  (Flask + flask-restx)               │
-│ (mic/file/  │                   │                                      │
-│  url/stdin  │                   │  ┌────────────────────┐              │
-│  /youtube)  │                   │  │ audio_stack queue  │              │
-└─────────────┘                   │  └─────────┬──────────┘              │
-                                  │            ▼                         │
-                                  │  ┌────────────────────┐              │
-                                  │  │ process_audio()    │──> ProviderRegistry
-                                  │  │ worker thread      │       ↓            │
-                                  │  └─────────┬──────────┘  FasterWhisperLocal│
-                                  │            ▼             (CTranslate2)     │
-                                  │  transcriptd (in-memory) NLLBCTranslate2   │
-                                  │   tenant -> chunk -> txt (CTranslate2)     │
-                                  └──────────────────────────────────────┘
-                                               ▲
-=======
-```
 ┌─────────────┐  POST /session   ┌──────────────────────────┐
 │ audio_      │ POST /transcripts│  transcribe_server.py    │
 │ grabber.py  │ ───────────────> │  (Flask + flask-restx)   │
@@ -44,7 +26,6 @@ A real-time speech-to-text (transcription) HTTP API built with Flask + flask-res
                                  │   tenant -> chunk -> txt │
                                  └──────────────────────────┘
                                               ▲
->>>>>>> 77f47a9 (corrected the stream type for whitelisted streams)
                   GET /transcripts, /transcripts/first, etc.
 ```
 
@@ -97,13 +78,8 @@ All API endpoints now require JWT authentication. The app requires `JWT_SECRET_K
 All endpoints are available under `/swagger`.
 
 | Method | Path | Purpose |
-<<<<<<< HEAD
 | --- | --- | --- |
-| `POST` | `/session` | Mint a tenant UUID for a source (`mic`/`file`/`url`/`stdin`/`youtube`) — returns `201 Created` |
-=======
-|---|---|---|
 | `POST` | `/session` | Mint a tenant UUID for a source (`mic`/`file`/`url`/`stdin`/`platform`) — returns `201 Created` |
->>>>>>> 77f47a9 (corrected the stream type for whitelisted streams)
 | `POST` | `/transcripts` | Submit a base64 audio chunk for async processing — returns `202 Accepted` |
 | `GET` | `/transcripts` | All transcripts in `[from, until]` |
 | `GET` | `/transcripts/count` | Count of transcripts in `[from, until]` |

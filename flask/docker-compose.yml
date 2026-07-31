@@ -45,6 +45,7 @@ services:
       - MKL_NUM_THREADS=2
       - NUMEXPR_NUM_THREADS=2
       - TOKENIZERS_PARALLELISM=false
+      - XDG_CACHE_HOME=/app/.cache
     volumes:
       - ./instance:/app/instance
       - model_cache:/app/.cache
